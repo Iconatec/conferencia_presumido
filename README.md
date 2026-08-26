@@ -18,11 +18,11 @@ Aplicação para conferir guias PIS/COFINS em PDF contra a planilha `Apuração-
 7. Gera o arquivo `resultado_conferencia.xlsx` na pasta onde está a planilha de entrada.
 
 # Regras de resultado | Situação | Status Final |
-> PDF localizado, período igual e valor igual | `ok` |
-> PDF localizado, mas período diferente | `revisar` — Período de apuração divergente |
-> PDF localizado e valor diferente | `revisar` — Valor de guia incorreto |
-> Linha da planilha sem PDF correspondente | `revisar` — Apenas planilha |
-> PDF sem linha correspondente na planilha | `revisar` — Apenas Guia |
+- PDF localizado, período igual e valor igual | `ok` |
+- PDF localizado, mas período diferente | `revisar` — Período de apuração divergente |
+- PDF localizado e valor diferente | `revisar` — Valor de guia incorreto |
+- Linha da planilha sem PDF correspondente | `revisar` — Apenas planilha |
+- PDF sem linha correspondente na planilha | `revisar` — Apenas Guia |
 
 A conferência considera as informações corretas somente quando o PDF é localizado, o período de apuração é igual ao período da planilha e a diferença entre os valores é exatamente `0,00`.
 
