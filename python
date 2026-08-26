@@ -1,0 +1,494 @@
+from __future__ import annotations
+
+import re
+import sys
+import unicodedata
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+
+MESES = {
+    "janeiro": "01", "fevereiro": "02", "marco": "03",
+    "abril": "04", "maio": "05", "junho": "06",
+    "julho": "07", "agosto": "08", "setembro": "09",
+    "outubro": "10", "novembro": "11", "dezembro": "12",
+}
+
+MESES_EXIBICAO = {
+    "01": "Janeiro", "02": "Fevereiro", "03": "Março",
+    "04": "Abril", "05": "Maio", "06": "Junho",
+    "07": "Julho", "08": "Agosto", "09": "Setembro",
+    "10": "Outubro", "11": "Novembro", "12": "Dezembro",
+}
+
+COLUNAS_RESULTADO = [
+    "Valor PDF",
+    "Diferença",
+    "Status Final",
+    "Situação",
+]
+
+
+# --------------------------------------------------------------------------
+# Utilitários de texto e número
+# --------------------------------------------------------------------------
+
+def texto(valor: Any) -> str:
+    if valor is None:
+        return ""
+    try:
+        if pd.isna(valor):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return re.sub(r"\s+", " ", str(valor).replace("\u00a0", " ")).strip()
+
+
+def sem_acentos(valor: Any) -> str:
+    return "".join(
+        caractere
+        for caractere in unicodedata.normalize("NFD", texto(valor))
+        if unicodedata.category(caractere) != "Mn"
+    ).lower()
+
+
+def texto_chave(valor: Any) -> str:
+    return sem_acentos(valor).upper()
+
+
+def numero(valor: Any) -> float | None:
+    if valor is None:
+        return None
+
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool):
+        try:
+            if pd.isna(valor):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return float(Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    valor_texto = texto(valor).replace("R$", "").replace(" ", "")
+    if not valor_texto:
+        return None
+
+    if "," in valor_texto:
+        valor_texto = valor_texto.replace(".", "").replace(",", ".")
+
+    try:
+        return float(Decimal(valor_texto).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def normalizar_cnpj(valor: Any) -> str:
+    return re.sub(r"\D", "", texto(valor))
+
+
+def formatar_cnpj(valor: Any) -> str:
+    digitos = normalizar_cnpj(valor)
+    if len(digitos) != 14:
+        return texto(valor)
+    return f"{digitos[:2]}.{digitos[2:5]}.{digitos[5:8]}/{digitos[8:12]}-{digitos[12:]}"
+
+
+def normalizar_codigo(valor: Any) -> str:
+    codigo = texto(valor).split("-")[0]
+    return re.sub(r"\D", "", codigo).zfill(4)
+
+
+def normalizar_periodo(valor: Any) -> str:
+    valor_normalizado = sem_acentos(valor).replace(" ", "")
+
+    encontrado = re.search(
+        r"(janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|"
+        r"setembro|outubro|novembro|dezembro)[/-]?(\d{4})",
+        valor_normalizado,
+    )
+    if encontrado:
+        return f"{encontrado.group(2)}-{MESES[encontrado.group(1)]}"
+
+    encontrado = re.search(r"(\d{1,2})[/-](\d{4})", valor_normalizado)
+    if encontrado:
+        return f"{encontrado.group(2)}-{encontrado.group(1).zfill(2)}"
+
+    encontrado = re.search(r"(\d{4})[/-](\d{1,2})", valor_normalizado)
+    if encontrado:
+        return f"{encontrado.group(1)}-{encontrado.group(2).zfill(2)}"
+
+    return valor_normalizado
+
+
+def periodo_exibicao(valor: Any) -> str:
+    periodo = normalizar_periodo(valor)
+    encontrado = re.fullmatch(r"(\d{4})-(\d{2})", periodo)
+    if not encontrado:
+        return texto(valor)
+    ano, mes = encontrado.groups()
+    return f"{MESES_EXIBICAO.get(mes, mes)}/{ano}"
+
+
+# --------------------------------------------------------------------------
+# Extração dos PDFs
+# --------------------------------------------------------------------------
+
+def extrair_texto_pdf(caminho: Path) -> str:
+    if pdfplumber is not None:
+        with pdfplumber.open(caminho) as pdf:
+            return "\n".join(pagina.extract_text() or "" for pagina in pdf.pages)
+
+    if fitz is not None:
+        documento = fitz.open(caminho)
+        try:
+            return "\n".join(pagina.get_text() for pagina in documento)
+        finally:
+            documento.close()
+
+    raise RuntimeError(
+        "Instale pdfplumber ou PyMuPDF para ler os PDFs. "
+        "Exemplo: pip install pdfplumber"
+    )
+
+
+def capturar(texto_pdf: str, padrao: str, grupo: int = 1) -> str:
+    encontrado = re.search(padrao, texto_pdf, re.IGNORECASE | re.DOTALL)
+    return texto(encontrado.group(grupo)) if encontrado else ""
+
+
+def extrair_pdf(caminho: Path) -> dict[str, Any]:
+    texto_pdf = extrair_texto_pdf(caminho)
+
+    cnpj = capturar(texto_pdf, r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})")
+
+    razao_social = capturar(
+        texto_pdf,
+        r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\s+([\s\S]*?)\s+Per[íi]odo\s+de\s+Apura[çc][ãa]o",
+    )
+
+    valor_texto = capturar(
+        texto_pdf,
+        r"(?:C[óo]digo Principal|Valor Total do Documento)[\s\S]{0,180}?"
+        r"(\d{1,3}(?:\.\d{3})*,\d{2})",
+    )
+
+    codigo = capturar(
+        texto_pdf,
+        r"Composi[çc][ãa]o\s+do\s+Documento\s+de\s+Arrecada[çc][ãa]o[\s\S]{0,300}?\b(\d{4})\b",
+    )
+    if not codigo:
+        codigo = capturar(texto_pdf, r"C[óo]digo Principal\s*(\d{4})")
+    if not codigo:
+        match_pis_cofins = re.search(r"\b(8109|2172)\b", texto_pdf)
+        if match_pis_cofins:
+            codigo = match_pis_cofins.group(1)
+
+    periodo = ""
+    match_periodo = re.search(
+        r"\b(janeiro|fevereiro|mar[çc]o|abril|maio|junho|julho|agosto|"
+        r"setembro|outubro|novembro|dezembro)[/-]\s*(\d{4})\b",
+        texto_pdf,
+        re.IGNORECASE,
+    )
+    if match_periodo:
+        periodo = f"{match_periodo.group(1)}/{match_periodo.group(2)}"
+
+    return {
+        "arquivo_pdf": caminho.name,
+        "razao_social": texto_chave(razao_social),
+        "cnpj": normalizar_cnpj(cnpj),
+        "valor_pdf": numero(valor_texto),
+        "codigo": normalizar_codigo(codigo),
+        "periodo": normalizar_periodo(periodo),
+    }
+
+
+def nome_arquivo_pdf(caminho_pdf: str) -> str:
+    """Extrai o trecho entre o primeiro e o último '-' do nome do arquivo."""
+    nome = Path(caminho_pdf).stem
+    partes = [parte.strip() for parte in nome.split("-")]
+
+    if len(partes) >= 3:
+        nome_base = " - ".join(partes[1:-1])
+    else:
+        nome_base = nome
+
+    return sem_acentos(nome_base)
+
+
+# --------------------------------------------------------------------------
+# Leitura da planilha Base Guias
+# --------------------------------------------------------------------------
+
+def localizar_coluna(colunas: list[str], candidatos: list[str]) -> str | None:
+    mapa = {sem_acentos(coluna): coluna for coluna in colunas}
+
+    for candidato in candidatos:
+        if sem_acentos(candidato) in mapa:
+            return mapa[sem_acentos(candidato)]
+
+    for coluna in colunas:
+        coluna_normalizada = sem_acentos(coluna)
+        if any(sem_acentos(candidato) in coluna_normalizada for candidato in candidatos):
+            return coluna
+
+    return None
+
+
+def carregar_planilha(caminho: Path) -> tuple[pd.DataFrame, dict[str, str]]:
+    dataframe = pd.read_excel(caminho, sheet_name="Base Guias", dtype=object)
+    dataframe.columns = [texto(coluna) for coluna in dataframe.columns]
+    colunas = list(dataframe.columns)
+
+    campos = {
+        "razao_social": localizar_coluna(colunas, ["Razao Social", "Razão Social"]),
+        "cnpj": localizar_coluna(colunas, ["CNPJ"]),
+        "valor": localizar_coluna(colunas, ["Valor Guia"]),
+        "codigo": localizar_coluna(colunas, ["Codigo", "Código"]),
+        "periodo": localizar_coluna(colunas, ["Periodo", "Período"]),
+        "nome_arquivo": localizar_coluna(colunas, ["Nome Arquivo"]),
+    }
+
+    faltantes = [campo for campo, coluna in campos.items() if coluna is None]
+    if faltantes:
+        raise ValueError(
+            "Colunas não encontradas na aba 'Base Guias': " + ", ".join(faltantes)
+        )
+
+    return dataframe, campos  # type: ignore[return-value]
+
+
+def nome_arquivo_planilha(valor: Any) -> str:
+    return sem_acentos(texto(valor))
+
+
+# --------------------------------------------------------------------------
+# Cruzamento e conferência
+# --------------------------------------------------------------------------
+
+def comparar(
+    dataframe: pd.DataFrame,
+    campos: dict[str, str],
+    pdfs: list[dict[str, Any]],
+) -> pd.DataFrame:
+    pdfs_por_chave: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for indice, pdf in enumerate(pdfs):
+        chave = nome_arquivo_pdf(pdf["arquivo_pdf"])
+        pdfs_por_chave.setdefault(chave, []).append((indice, pdf))
+
+    usados: set[int] = set()
+    registros: list[dict[str, Any]] = []
+    colunas_originais = list(dataframe.columns)
+
+    for _, linha in dataframe.iterrows():
+        chave = nome_arquivo_planilha(linha[campos["nome_arquivo"]])
+        candidatos = pdfs_por_chave.get(chave, [])
+        encontrado = next((item for item in candidatos if item[0] not in usados), None)
+        pdf = None
+
+        if encontrado is not None:
+            indice_pdf, pdf = encontrado
+            usados.add(indice_pdf)
+
+        valor_planilha = numero(linha[campos["valor"]])
+        valor_pdf = pdf["valor_pdf"] if pdf else None
+        diferenca = (
+            round(valor_pdf - valor_planilha, 2)
+            if valor_pdf is not None and valor_planilha is not None
+            else None
+        )
+
+        periodo_planilha = normalizar_periodo(linha[campos["periodo"]])
+        periodo_pdf = pdf["periodo"] if pdf else None
+        periodo_ok = (
+            periodo_pdf is not None
+            and periodo_planilha == periodo_pdf
+        )
+
+        registro = {coluna: linha[coluna] for coluna in colunas_originais}
+        registro["Valor PDF"] = valor_pdf
+        registro["Diferença"] = diferenca
+
+        if pdf is None:
+            registro["Status Final"] = "revisar"
+            registro["Situação"] = "Apenas planilha"
+        elif not periodo_ok:
+            registro["Status Final"] = "revisar"
+            registro["Situação"] = "Período de apuração divergente"
+        elif diferenca == 0:
+            registro["Status Final"] = "ok"
+            registro["Situação"] = "Informações corretas"
+        else:
+            registro["Status Final"] = "revisar"
+            registro["Situação"] = "Valor de guia incorreto"
+
+        registros.append(registro)
+
+    # PDFs que existem mas não bateram com nenhuma linha da planilha
+    for indice, pdf in enumerate(pdfs):
+        if indice in usados:
+            continue
+
+        registro = {coluna: None for coluna in colunas_originais}
+        registro[campos["razao_social"]] = pdf["razao_social"]
+        registro[campos["cnpj"]] = formatar_cnpj(pdf["cnpj"])
+        registro[campos["periodo"]] = periodo_exibicao(pdf["periodo"])
+        registro[campos["valor"]] = None
+        registro[campos["codigo"]] = pdf["codigo"]
+        registro[campos["nome_arquivo"]] = Path(pdf["arquivo_pdf"]).stem
+        registro["Valor PDF"] = pdf["valor_pdf"]
+        registro["Diferença"] = None
+        registro["Status Final"] = "revisar"
+        registro["Situação"] = "Apenas Guia"
+        registros.append(registro)
+
+    return pd.DataFrame(registros, columns=colunas_originais + COLUNAS_RESULTADO)
+
+
+# --------------------------------------------------------------------------
+# Geração da planilha final
+# --------------------------------------------------------------------------
+
+def salvar_resultado(resultado: pd.DataFrame, caminho_excel_original: Path) -> Path:
+    caminho_saida = caminho_excel_original.parent / "resultado_conferencia.xlsx"
+
+    with pd.ExcelWriter(caminho_saida, engine="openpyxl") as writer:
+        resultado.to_excel(writer, index=False, sheet_name="Base Guias")
+        planilha = writer.book["Base Guias"]
+        planilha.freeze_panes = "A2"
+        planilha.auto_filter.ref = planilha.dimensions
+
+        cabecalho = {celula.value: celula.column for celula in planilha[1]}
+        for nome_coluna in ["Valor Guia", "Valor PDF", "Diferença"]:
+            coluna = cabecalho.get(nome_coluna)
+            if coluna:
+                for linha in range(2, planilha.max_row + 1):
+                    planilha.cell(linha, coluna).number_format = "#,##0.00"
+
+        # Pinta a célula Status Final de acordo com o resultado.
+        coluna_status = cabecalho.get("Status Final")
+        if coluna_status:
+            from openpyxl.styles import PatternFill
+
+            preenchimento_ok = PatternFill(
+                fill_type="solid",
+                fgColor="C6EFCE",
+            )
+            preenchimento_revisar = PatternFill(
+                fill_type="solid",
+                fgColor="FFC7CE",
+            )
+
+            for linha in range(2, planilha.max_row + 1):
+                celula = planilha.cell(linha, coluna_status)
+                valor_status = texto(celula.value).lower()
+
+                if valor_status == "ok":
+                    celula.fill = preenchimento_ok
+                elif valor_status == "revisar":
+                    celula.fill = preenchimento_revisar
+
+        for coluna in planilha.columns:
+            maior_tamanho = max(
+                len("" if celula.value is None else str(celula.value))
+                for celula in coluna
+            )
+            planilha.column_dimensions[coluna[0].column_letter].width = min(
+                maior_tamanho + 2,
+                60,
+            )
+
+    return caminho_saida
+
+
+# --------------------------------------------------------------------------
+# Orquestração
+# --------------------------------------------------------------------------
+
+def localizar_pdfs(pasta_pdfs: Path) -> list[Path]:
+    pdfs = sorted(
+        arquivo
+        for arquivo in pasta_pdfs.rglob("*.pdf")
+        if arquivo.is_file()
+    )
+    if not pdfs:
+        raise FileNotFoundError("Nenhum PDF foi encontrado na pasta informada.")
+    return pdfs
+
+
+def executar(pasta_pdfs: Path, caminho_excel: Path) -> Path:
+    caminhos_pdfs = localizar_pdfs(pasta_pdfs)
+    dataframe, campos = carregar_planilha(caminho_excel)
+    dados_pdfs = [extrair_pdf(caminho) for caminho in caminhos_pdfs]
+    resultado = comparar(dataframe, campos, dados_pdfs)
+    return salvar_resultado(resultado, caminho_excel)
+
+
+def _resolver_caminho_excel(caminho_informado: Path) -> Path:
+    """Aceita o caminho direto ou uma pasta contendo Apuração-Pis-Cofins."""
+    if caminho_informado.is_file():
+        return caminho_informado
+
+    if caminho_informado.is_dir():
+        nome_alvo = "apuracao-pis-cofins"
+        for arquivo in caminho_informado.iterdir():
+            if (
+                arquivo.suffix.lower() in {".xlsx", ".xls"}
+                and sem_acentos(arquivo.stem) == nome_alvo
+            ):
+                return arquivo
+        raise FileNotFoundError(
+            "Arquivo 'Apuração-Pis-Cofins.xlsx' não encontrado na pasta: "
+            f"{caminho_informado}"
+        )
+
+    raise FileNotFoundError(f"Caminho não encontrado: {caminho_informado}")
+
+
+def main() -> None:
+    print("Conferência de guias PIS/COFINS — PDF x planilha")
+    print()
+
+    entrada_pdfs = input(
+        "Caminho da pasta com os PDFs das guias: "
+    ).strip().strip('"')
+    entrada_excel = input(
+        "Caminho do arquivo Excel 'Apuração-Pis-Cofins.xlsx': "
+    ).strip().strip('"')
+
+    pasta_pdfs = Path(entrada_pdfs).expanduser().resolve()
+    caminho_excel_informado = Path(entrada_excel).expanduser().resolve()
+
+    if not pasta_pdfs.is_dir():
+        print(f"Erro: pasta dos PDFs não encontrada: {pasta_pdfs}")
+        sys.exit(1)
+
+    try:
+        caminho_excel = _resolver_caminho_excel(caminho_excel_informado)
+        caminho_saida = executar(pasta_pdfs, caminho_excel)
+        print()
+        print(f"Arquivo criado com sucesso: {caminho_saida}")
+    except Exception as erro:
+        print()
+        print(f"Erro: {erro}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+
