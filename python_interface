@@ -1,0 +1,897 @@
+from __future__ import annotations
+
+import ctypes
+import os
+import re
+import sys
+import threading
+import unicodedata
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
+from tkinter import filedialog, messagebox
+from typing import Any, Callable
+
+import customtkinter as ctk
+import pandas as pd
+from PIL import Image, ImageOps
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+
+MESES = {
+    "janeiro": "01", "fevereiro": "02", "marco": "03",
+    "abril": "04", "maio": "05", "junho": "06",
+    "julho": "07", "agosto": "08", "setembro": "09",
+    "outubro": "10", "novembro": "11", "dezembro": "12",
+}
+
+MESES_EXIBICAO = {
+    "01": "Janeiro", "02": "Fevereiro", "03": "Março",
+    "04": "Abril", "05": "Maio", "06": "Junho",
+    "07": "Julho", "08": "Agosto", "09": "Setembro",
+    "10": "Outubro", "11": "Novembro", "12": "Dezembro",
+}
+
+COLUNAS_RESULTADO = [
+    "Valor PDF",
+    "Diferença",
+    "Status Final",
+    "Situação",
+]
+
+
+def texto(valor: Any) -> str:
+    if valor is None:
+        return ""
+    try:
+        if pd.isna(valor):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return re.sub(r"\s+", " ", str(valor).replace("\u00a0", " ")).strip()
+
+
+def sem_acentos(valor: Any) -> str:
+    return "".join(
+        caractere
+        for caractere in unicodedata.normalize("NFD", texto(valor))
+        if unicodedata.category(caractere) != "Mn"
+    ).lower()
+
+
+def texto_chave(valor: Any) -> str:
+    return sem_acentos(valor).upper()
+
+
+def numero(valor: Any) -> float | None:
+    if valor is None:
+        return None
+
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool):
+        try:
+            if pd.isna(valor):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return float(Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    valor_texto = texto(valor).replace("R$", "").replace(" ", "")
+    if not valor_texto:
+        return None
+
+    if "," in valor_texto:
+        valor_texto = valor_texto.replace(".", "").replace(",", ".")
+
+    try:
+        return float(Decimal(valor_texto).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def normalizar_cnpj(valor: Any) -> str:
+    return re.sub(r"\D", "", texto(valor))
+
+
+def formatar_cnpj(valor: Any) -> str:
+    digitos = normalizar_cnpj(valor)
+    if len(digitos) != 14:
+        return texto(valor)
+    return f"{digitos[:2]}.{digitos[2:5]}.{digitos[5:8]}/{digitos[8:12]}-{digitos[12:]}"
+
+
+def normalizar_codigo(valor: Any) -> str:
+    codigo = texto(valor).split("-")[0]
+    return re.sub(r"\D", "", codigo).zfill(4)
+
+
+def normalizar_periodo(valor: Any) -> str:
+    valor_normalizado = sem_acentos(valor).replace(" ", "")
+
+    encontrado = re.search(
+        r"(janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|"
+        r"setembro|outubro|novembro|dezembro)[/-]?(\d{4})",
+        valor_normalizado,
+    )
+    if encontrado:
+        return f"{encontrado.group(2)}-{MESES[encontrado.group(1)]}"
+
+    encontrado = re.search(r"(\d{1,2})[/-](\d{4})", valor_normalizado)
+    if encontrado:
+        return f"{encontrado.group(2)}-{encontrado.group(1).zfill(2)}"
+
+    encontrado = re.search(r"(\d{4})[/-](\d{1,2})", valor_normalizado)
+    if encontrado:
+        return f"{encontrado.group(1)}-{encontrado.group(2).zfill(2)}"
+
+    return valor_normalizado
+
+
+def periodo_exibicao(valor: Any) -> str:
+    periodo = normalizar_periodo(valor)
+    encontrado = re.fullmatch(r"(\d{4})-(\d{2})", periodo)
+    if not encontrado:
+        return texto(valor)
+    ano, mes = encontrado.groups()
+    return f"{MESES_EXIBICAO.get(mes, mes)}/{ano}"
+
+
+def extrair_texto_pdf(caminho: Path) -> str:
+    if pdfplumber is not None:
+        with pdfplumber.open(caminho) as pdf:
+            return "\n".join(pagina.extract_text() or "" for pagina in pdf.pages)
+
+    if fitz is not None:
+        documento = fitz.open(caminho)
+        try:
+            return "\n".join(pagina.get_text() for pagina in documento)
+        finally:
+            documento.close()
+
+    raise RuntimeError(
+        "Instale pdfplumber ou PyMuPDF para ler os PDFs. "
+        "Exemplo: py -m pip install pdfplumber"
+    )
+
+
+def capturar(texto_pdf: str, padrao: str, grupo: int = 1) -> str:
+    encontrado = re.search(padrao, texto_pdf, re.IGNORECASE | re.DOTALL)
+    return texto(encontrado.group(grupo)) if encontrado else ""
+
+
+def extrair_pdf(caminho: Path) -> dict[str, Any]:
+    texto_pdf = extrair_texto_pdf(caminho)
+
+    cnpj = capturar(texto_pdf, r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})")
+    razao_social = capturar(
+        texto_pdf,
+        r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\s+([\s\S]*?)\s+Per[íi]odo\s+de\s+Apura[çc][ãa]o",
+    )
+    valor_texto = capturar(
+        texto_pdf,
+        r"(?:C[óo]digo Principal|Valor Total do Documento)[\s\S]{0,180}?"
+        r"(\d{1,3}(?:\.\d{3})*,\d{2})",
+    )
+
+    codigo = capturar(
+        texto_pdf,
+        r"Composi[çc][ãa]o\s+do\s+Documento\s+de\s+Arrecada[çc][ãa]o"
+        r"[\s\S]{0,300}?\b(\d{4})\b",
+    )
+    if not codigo:
+        codigo = capturar(texto_pdf, r"C[óo]digo Principal\s*(\d{4})")
+    if not codigo:
+        match_pis_cofins = re.search(r"\b(8109|2172)\b", texto_pdf)
+        if match_pis_cofins:
+            codigo = match_pis_cofins.group(1)
+
+    periodo = ""
+    match_periodo = re.search(
+        r"\b(janeiro|fevereiro|mar[çc]o|abril|maio|junho|julho|agosto|"
+        r"setembro|outubro|novembro|dezembro)[/-]\s*(\d{4})\b",
+        texto_pdf,
+        re.IGNORECASE,
+    )
+    if match_periodo:
+        periodo = f"{match_periodo.group(1)}/{match_periodo.group(2)}"
+
+    return {
+        "arquivo_pdf": caminho.name,
+        "razao_social": texto_chave(razao_social),
+        "cnpj": normalizar_cnpj(cnpj),
+        "valor_pdf": numero(valor_texto),
+        "codigo": normalizar_codigo(codigo),
+        "periodo": normalizar_periodo(periodo),
+    }
+
+
+def nome_arquivo_pdf(caminho_pdf: str) -> str:
+    nome = Path(caminho_pdf).stem
+    partes = [parte.strip() for parte in nome.split("-")]
+
+    if len(partes) >= 3:
+        nome_base = " - ".join(partes[1:-1])
+    else:
+        nome_base = nome
+
+    return sem_acentos(nome_base)
+
+
+def localizar_coluna(colunas: list[str], candidatos: list[str]) -> str | None:
+    mapa = {sem_acentos(coluna): coluna for coluna in colunas}
+
+    for candidato in candidatos:
+        if sem_acentos(candidato) in mapa:
+            return mapa[sem_acentos(candidato)]
+
+    for coluna in colunas:
+        coluna_normalizada = sem_acentos(coluna)
+        if any(sem_acentos(candidato) in coluna_normalizada for candidato in candidatos):
+            return coluna
+
+    return None
+
+
+def carregar_planilha(caminho: Path) -> tuple[pd.DataFrame, dict[str, str]]:
+    dataframe = pd.read_excel(caminho, sheet_name="Base Guias", dtype=object)
+    dataframe.columns = [texto(coluna) for coluna in dataframe.columns]
+    colunas = list(dataframe.columns)
+
+    campos = {
+        "razao_social": localizar_coluna(colunas, ["Razao Social", "Razão Social"]),
+        "cnpj": localizar_coluna(colunas, ["CNPJ"]),
+        "valor": localizar_coluna(colunas, ["Valor Guia"]),
+        "codigo": localizar_coluna(colunas, ["Codigo", "Código"]),
+        "periodo": localizar_coluna(colunas, ["Periodo", "Período"]),
+        "nome_arquivo": localizar_coluna(colunas, ["Nome Arquivo"]),
+    }
+
+    faltantes = [campo for campo, coluna in campos.items() if coluna is None]
+    if faltantes:
+        raise ValueError(
+            "Colunas não encontradas na aba 'Base Guias': " + ", ".join(faltantes)
+        )
+
+    return dataframe, campos  # type: ignore[return-value]
+
+
+def nome_arquivo_planilha(valor: Any) -> str:
+    return sem_acentos(texto(valor))
+
+
+def comparar(
+    dataframe: pd.DataFrame,
+    campos: dict[str, str],
+    pdfs: list[dict[str, Any]],
+) -> pd.DataFrame:
+    pdfs_por_chave: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for indice, pdf in enumerate(pdfs):
+        chave = nome_arquivo_pdf(pdf["arquivo_pdf"])
+        pdfs_por_chave.setdefault(chave, []).append((indice, pdf))
+
+    usados: set[int] = set()
+    registros: list[dict[str, Any]] = []
+    colunas_originais = list(dataframe.columns)
+
+    for _, linha in dataframe.iterrows():
+        chave = nome_arquivo_planilha(linha[campos["nome_arquivo"]])
+        candidatos = pdfs_por_chave.get(chave, [])
+        encontrado = next((item for item in candidatos if item[0] not in usados), None)
+        pdf = None
+
+        if encontrado is not None:
+            indice_pdf, pdf = encontrado
+            usados.add(indice_pdf)
+
+        valor_planilha = numero(linha[campos["valor"]])
+        valor_pdf = pdf["valor_pdf"] if pdf else None
+        diferenca = (
+            round(valor_pdf - valor_planilha, 2)
+            if valor_pdf is not None and valor_planilha is not None
+            else None
+        )
+
+        periodo_planilha = normalizar_periodo(linha[campos["periodo"]])
+        periodo_pdf = pdf["periodo"] if pdf else None
+        periodo_ok = periodo_pdf is not None and periodo_planilha == periodo_pdf
+
+        registro = {coluna: linha[coluna] for coluna in colunas_originais}
+        registro["Valor PDF"] = valor_pdf
+        registro["Diferença"] = diferenca
+
+        if pdf is None:
+            registro["Status Final"] = "revisar"
+            registro["Situação"] = "Apenas planilha"
+        elif not periodo_ok:
+            registro["Status Final"] = "revisar"
+            registro["Situação"] = "Período de apuração divergente"
+        elif diferenca == 0:
+            registro["Status Final"] = "ok"
+            registro["Situação"] = "Informações corretas"
+        else:
+            registro["Status Final"] = "revisar"
+            registro["Situação"] = "Valor de guia incorreto"
+
+        registros.append(registro)
+
+    for indice, pdf in enumerate(pdfs):
+        if indice in usados:
+            continue
+
+        registro = {coluna: None for coluna in colunas_originais}
+        registro[campos["razao_social"]] = pdf["razao_social"]
+        registro[campos["cnpj"]] = formatar_cnpj(pdf["cnpj"])
+        registro[campos["periodo"]] = periodo_exibicao(pdf["periodo"])
+        registro[campos["valor"]] = None
+        registro[campos["codigo"]] = pdf["codigo"]
+        registro[campos["nome_arquivo"]] = Path(pdf["arquivo_pdf"]).stem
+        registro["Valor PDF"] = pdf["valor_pdf"]
+        registro["Diferença"] = None
+        registro["Status Final"] = "revisar"
+        registro["Situação"] = "Apenas Guia"
+        registros.append(registro)
+
+    return pd.DataFrame(registros, columns=colunas_originais + COLUNAS_RESULTADO)
+
+
+def salvar_resultado(resultado: pd.DataFrame, caminho_excel_original: Path) -> Path:
+    caminho_saida = caminho_excel_original.parent / "resultado_conferencia.xlsx"
+
+    with pd.ExcelWriter(caminho_saida, engine="openpyxl") as writer:
+        resultado.to_excel(writer, index=False, sheet_name="Base Guias")
+        planilha = writer.book["Base Guias"]
+        planilha.freeze_panes = "A2"
+        planilha.auto_filter.ref = planilha.dimensions
+
+        cabecalho = {celula.value: celula.column for celula in planilha[1]}
+        for nome_coluna in ["Valor Guia", "Valor PDF", "Diferença"]:
+            coluna = cabecalho.get(nome_coluna)
+            if coluna:
+                for linha in range(2, planilha.max_row + 1):
+                    planilha.cell(linha, coluna).number_format = "#,##0.00"
+
+        coluna_status = cabecalho.get("Status Final")
+        if coluna_status:
+            from openpyxl.styles import Font, PatternFill
+
+            preenchimento_ok = PatternFill(fill_type="solid", fgColor="C6EFCE")
+            preenchimento_revisar = PatternFill(fill_type="solid", fgColor="FFC7CE")
+            fonte_ok = Font(color="006100")
+            fonte_revisar = Font(color="9C0006")
+
+            for linha in range(2, planilha.max_row + 1):
+                celula = planilha.cell(linha, coluna_status)
+                valor_status = texto(celula.value).lower()
+
+                if valor_status == "ok":
+                    celula.fill = preenchimento_ok
+                    celula.font = fonte_ok
+                elif valor_status == "revisar":
+                    celula.fill = preenchimento_revisar
+                    celula.font = fonte_revisar
+
+        for coluna in planilha.columns:
+            maior_tamanho = max(
+                len("" if celula.value is None else str(celula.value))
+                for celula in coluna
+            )
+            planilha.column_dimensions[coluna[0].column_letter].width = min(
+                maior_tamanho + 2,
+                60,
+            )
+
+    return caminho_saida
+
+
+def localizar_pdfs(pasta_pdfs: Path) -> list[Path]:
+    pdfs = sorted(
+        arquivo for arquivo in pasta_pdfs.rglob("*.pdf") if arquivo.is_file()
+    )
+    if not pdfs:
+        raise FileNotFoundError("Nenhum PDF foi encontrado na pasta informada.")
+    return pdfs
+
+
+def executar_com_progresso(
+    pasta_pdfs: Path,
+    caminho_excel: Path,
+    callback_progresso: Callable[[int, int, str], None] | None = None,
+) -> tuple[Path, int]:
+    caminhos_pdfs = localizar_pdfs(pasta_pdfs)
+    dataframe, campos = carregar_planilha(caminho_excel)
+    dados_pdfs: list[dict[str, Any]] = []
+    total = len(caminhos_pdfs)
+
+    for indice, caminho_pdf in enumerate(caminhos_pdfs, start=1):
+        if callback_progresso:
+            callback_progresso(indice - 1, total, caminho_pdf.name)
+        dados_pdfs.append(extrair_pdf(caminho_pdf))
+        if callback_progresso:
+            callback_progresso(indice, total, caminho_pdf.name)
+
+    resultado = comparar(dataframe, campos, dados_pdfs)
+    return salvar_resultado(resultado, caminho_excel), total
+
+
+def caminho_recurso(nome_arquivo: str) -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / nome_arquivo
+    return Path(__file__).resolve().parent / nome_arquivo
+
+
+def aplicar_icone_janela(janela: ctk.CTk) -> None:
+    caminho_ico = caminho_recurso("icone.ico")
+    if caminho_ico.exists():
+        try:
+            janela.iconbitmap(default=str(caminho_ico))
+        except Exception:
+            pass
+
+
+class ConferenciaApp:
+    AZUL = "#123B66"
+    AZUL_HOVER = "#0D2D4D"
+    VERDE = "#16A36A"
+    VERMELHO = "#D64545"
+    FUNDO_CLARO = "#F6F8FB"
+    FUNDO_ESCURO = "#141A22"
+    CARD_ESCURO = "#1F2937"
+
+    def __init__(self, raiz: ctk.CTk):
+        self.raiz = raiz
+        self.pasta_pdfs = ctk.StringVar()
+        self.caminho_excel = ctk.StringVar()
+        self.arquivo_saida: Path | None = None
+        self.modo_escuro = True
+        self.logo_imagem = self.carregar_logo()
+
+        self.raiz.title("ÍCONA | Conferência de Guias PIS/COFINS")
+        aplicar_icone_janela(self.raiz)
+        self.raiz.geometry("690x470")
+        self.raiz.minsize(650, 470)
+        self.raiz.resizable(True, False)
+        self.criar_interface()
+
+    def carregar_logo(self) -> ctk.CTkImage | None:
+        nomes = [
+            "logo_icona.png",
+            "LOGO_ICONA_PB_INVERSA.png",
+            "LOGO_ICONA_PB_INVERSA.jpg",
+            "LOGO_ICONA_PB_INVERSA-2.jpg",
+        ]
+
+        for nome in nomes:
+            caminho = caminho_recurso(nome)
+            if not caminho.exists():
+                continue
+            try:
+                imagem_original = Image.open(caminho).convert("RGBA")
+                imagem_ajustada = ImageOps.contain(
+                    imagem_original,
+                    (115, 62),
+                    method=Image.Resampling.LANCZOS,
+                )
+                return ctk.CTkImage(
+                    light_image=imagem_ajustada,
+                    dark_image=imagem_ajustada,
+                    size=imagem_ajustada.size,
+                )
+            except Exception:
+                continue
+        return None
+
+    def criar_interface(self) -> None:
+        self.quadro = ctk.CTkFrame(
+            self.raiz,
+            corner_radius=0,
+            fg_color=(self.FUNDO_CLARO, self.FUNDO_ESCURO),
+        )
+        self.quadro.pack(fill="both", expand=True)
+        self.quadro.grid_columnconfigure(0, weight=1)
+        self.quadro.grid_rowconfigure(1, weight=1)
+        self.criar_cabecalho()
+        self.criar_conteudo()
+        self.criar_rodape()
+
+    def criar_cabecalho(self) -> None:
+        cabecalho = ctk.CTkFrame(
+            self.quadro,
+            fg_color=self.AZUL,
+            corner_radius=0,
+            height=82,
+        )
+        cabecalho.grid(row=0, column=0, sticky="ew")
+        cabecalho.grid_propagate(False)
+        cabecalho.grid_columnconfigure(1, weight=1)
+
+        if self.logo_imagem:
+            ctk.CTkLabel(
+                cabecalho,
+                text="",
+                image=self.logo_imagem,
+            ).grid(row=0, column=0, padx=(22, 13), pady=10)
+        else:
+            ctk.CTkLabel(
+                cabecalho,
+                text="ÍCONA",
+                text_color="white",
+                font=ctk.CTkFont(size=19, weight="bold"),
+            ).grid(row=0, column=0, padx=(22, 13), pady=14)
+
+        textos = ctk.CTkFrame(cabecalho, fg_color="transparent")
+        textos.grid(row=0, column=1, sticky="w", pady=12)
+        ctk.CTkLabel(
+            textos,
+            text="Conferência de Guias - PIS/COFINS",
+            text_color="white",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            textos,
+            text="Conferência automática de PDFs e planilha",
+            text_color="#DCEBFA",
+            font=ctk.CTkFont(size=12),
+        ).pack(anchor="w", pady=(2, 0))
+
+    def criar_conteudo(self) -> None:
+        area = ctk.CTkFrame(self.quadro, fg_color="transparent")
+        area.grid(row=1, column=0, sticky="nsew", padx=22, pady=(18, 8))
+        area.grid_columnconfigure(0, weight=1)
+
+        self.card = ctk.CTkFrame(
+            area,
+            corner_radius=12,
+            fg_color=("#FFFFFF", self.CARD_ESCURO),
+            border_width=1,
+            border_color=("#DCE3EC", "#334155"),
+        )
+        self.card.grid(row=0, column=0, sticky="ew")
+        self.card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            self.card,
+            text="Arquivos para conferência",
+            text_color=("#1F2937", "#F8FAFC"),
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=18, pady=(16, 3))
+        ctk.CTkLabel(
+            self.card,
+            text="Informe a pasta dos PDFs e o arquivo Apuração-Pis-Cofins.",
+            text_color=("#6B7280", "#CBD5E1"),
+            font=ctk.CTkFont(size=12),
+        ).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 14))
+
+        self.criar_linha_pasta(
+            2,
+            "Pasta dos PDFs",
+            self.pasta_pdfs,
+            self.selecionar_pasta_pdfs,
+            "botao_selecionar_pdfs",
+        )
+        self.criar_linha_arquivo_excel()
+
+        self.botao_processar = ctk.CTkButton(
+            self.card,
+            text="Conferir guias",
+            command=self.iniciar_processamento,
+            height=38,
+            corner_radius=8,
+            fg_color=self.AZUL,
+            hover_color=self.AZUL_HOVER,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.botao_processar.grid(row=8, column=0, sticky="w", padx=18, pady=(12, 17))
+
+        self.status = ctk.StringVar(value="Selecione os arquivos para iniciar.")
+        ctk.CTkLabel(
+            area,
+            textvariable=self.status,
+            text_color=("#6B7280", "#CBD5E1"),
+            font=ctk.CTkFont(size=12),
+        ).grid(row=1, column=0, sticky="w", pady=(13, 5))
+
+        self.progresso = ctk.CTkProgressBar(
+            area,
+            height=11,
+            corner_radius=6,
+            progress_color=self.VERDE,
+            fg_color=("#DCE3EC", "#334155"),
+        )
+        self.progresso.grid(row=2, column=0, sticky="ew")
+        self.progresso.set(0)
+
+        self.percentual = ctk.StringVar(value="0%")
+        ctk.CTkLabel(
+            area,
+            textvariable=self.percentual,
+            text_color=("#6B7280", "#CBD5E1"),
+            font=ctk.CTkFont(size=11),
+        ).grid(row=3, column=0, sticky="e", pady=(3, 0))
+
+        self.resultado = ctk.StringVar(value="")
+        self.label_resultado = ctk.CTkLabel(
+            area,
+            textvariable=self.resultado,
+            justify="left",
+            anchor="w",
+            wraplength=630,
+            text_color=(self.VERDE, "#4ADE80"),
+            font=ctk.CTkFont(size=12),
+        )
+        self.label_resultado.grid(row=4, column=0, sticky="w", pady=(9, 3))
+
+        self.botao_abrir = ctk.CTkButton(
+            area,
+            text="Abrir planilha",
+            command=self.abrir_planilha,
+            state="disabled",
+            width=126,
+            height=32,
+            corner_radius=8,
+            fg_color=("#E7EDF4", "#334155"),
+            hover_color=("#D8E1EB", "#475569"),
+            text_color=("#1F2937", "#F8FAFC"),
+        )
+        self.botao_abrir.grid(row=5, column=0, sticky="w", pady=(2, 0))
+
+    def criar_linha_pasta(
+        self,
+        linha: int,
+        rotulo: str,
+        variavel: ctk.StringVar,
+        comando: Callable[[], None],
+        atributo_botao: str,
+    ) -> None:
+        ctk.CTkLabel(
+            self.card,
+            text=rotulo,
+            text_color=("#1F2937", "#F8FAFC"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=linha, column=0, sticky="w", padx=18, pady=(0 if linha == 2 else 11, 5))
+
+        linha_frame = ctk.CTkFrame(self.card, fg_color="transparent")
+        linha_frame.grid(row=linha + 1, column=0, sticky="ew", padx=18)
+        linha_frame.grid_columnconfigure(0, weight=1)
+
+        entrada = ctk.CTkEntry(
+            linha_frame,
+            textvariable=variavel,
+            height=34,
+            corner_radius=7,
+            border_color=("#C9D3DF", "#334155"),
+            fg_color=("#FFFFFF", "#111827"),
+            text_color=("#1F2937", "#F8FAFC"),
+        )
+        entrada.grid(row=0, column=0, sticky="ew")
+
+        botao = ctk.CTkButton(
+            linha_frame,
+            text="Selecionar",
+            command=comando,
+            width=104,
+            height=34,
+            corner_radius=7,
+            fg_color=("#E7EDF4", "#334155"),
+            hover_color=("#D8E1EB", "#475569"),
+            text_color=("#1F2937", "#F8FAFC"),
+        )
+        botao.grid(row=0, column=1, padx=(9, 0))
+        setattr(self, atributo_botao, botao)
+
+    def criar_linha_arquivo_excel(self) -> None:
+        linha = 4
+        ctk.CTkLabel(
+            self.card,
+            text="Arquivo Excel Apuração-Pis-Cofins",
+            text_color=("#1F2937", "#F8FAFC"),
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=linha, column=0, sticky="w", padx=18, pady=(11, 5))
+
+        linha_frame = ctk.CTkFrame(self.card, fg_color="transparent")
+        linha_frame.grid(row=linha + 1, column=0, sticky="ew", padx=18)
+        linha_frame.grid_columnconfigure(0, weight=1)
+
+        entrada = ctk.CTkEntry(
+            linha_frame,
+            textvariable=self.caminho_excel,
+            height=34,
+            corner_radius=7,
+            border_color=("#C9D3DF", "#334155"),
+            fg_color=("#FFFFFF", "#111827"),
+            text_color=("#1F2937", "#F8FAFC"),
+        )
+        entrada.grid(row=0, column=0, sticky="ew")
+
+        self.botao_selecionar_excel = ctk.CTkButton(
+            linha_frame,
+            text="Selecionar",
+            command=self.selecionar_arquivo_excel,
+            width=104,
+            height=34,
+            corner_radius=7,
+            fg_color=("#E7EDF4", "#334155"),
+            hover_color=("#D8E1EB", "#475569"),
+            text_color=("#1F2937", "#F8FAFC"),
+        )
+        self.botao_selecionar_excel.grid(row=0, column=1, padx=(9, 0))
+
+    def criar_rodape(self) -> None:
+        rodape = ctk.CTkFrame(self.quadro, fg_color="transparent")
+        rodape.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 13))
+        rodape.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            rodape,
+            text="ÍCONA",
+            text_color=("#6B7280", "#CBD5E1"),
+            font=ctk.CTkFont(size=10, weight="bold"),
+        ).grid(row=0, column=0, sticky="w")
+
+        self.botao_tema = ctk.CTkButton(
+            rodape,
+            text="☀ Claro",
+            command=self.alternar_tema,
+            width=98,
+            height=28,
+            corner_radius=14,
+            fg_color=("#E7EDF4", "#334155"),
+            hover_color=("#D8E1EB", "#475569"),
+            text_color=("#1F2937", "#F8FAFC"),
+            font=ctk.CTkFont(size=11, weight="bold"),
+        )
+        self.botao_tema.grid(row=0, column=1, sticky="e")
+
+    def alternar_tema(self) -> None:
+        self.modo_escuro = not self.modo_escuro
+        ctk.set_appearance_mode("Dark" if self.modo_escuro else "Light")
+        self.botao_tema.configure(text="☀ Claro" if self.modo_escuro else "☾ Escuro")
+
+    def selecionar_pasta_pdfs(self) -> None:
+        pasta = filedialog.askdirectory(
+            title="Selecione a pasta dos PDFs",
+            initialdir=self.pasta_pdfs.get() or str(Path.home()),
+        )
+        if pasta:
+            self.pasta_pdfs.set(pasta)
+            self.resultado.set("")
+            self.botao_abrir.configure(state="disabled")
+
+    def selecionar_arquivo_excel(self) -> None:
+        arquivo = filedialog.askopenfilename(
+            title="Selecione o arquivo Apuração-Pis-Cofins.xlsx",
+            initialdir=str(Path(self.pasta_pdfs.get()).parent) if self.pasta_pdfs.get() else str(Path.home()),
+            filetypes=[("Arquivos Excel", "*.xlsx *.xls"), ("Todos os arquivos", "*.*")],
+        )
+        if arquivo:
+            self.caminho_excel.set(arquivo)
+            self.resultado.set("")
+            self.botao_abrir.configure(state="disabled")
+
+    def iniciar_processamento(self) -> None:
+        pasta_pdfs = Path(self.pasta_pdfs.get().strip()).expanduser().resolve()
+        caminho_excel = Path(self.caminho_excel.get().strip().strip('"')).expanduser().resolve()
+
+        if not pasta_pdfs.is_dir():
+            messagebox.showerror("Pasta inválida", "Selecione uma pasta válida de PDFs.")
+            return
+        if not caminho_excel.is_file():
+            messagebox.showerror("Arquivo inválido", "Selecione um arquivo Excel válido.")
+            return
+
+        for botao in [
+            self.botao_processar,
+            self.botao_selecionar_pdfs,
+            self.botao_selecionar_excel,
+            self.botao_abrir,
+        ]:
+            botao.configure(state="disabled")
+
+        self.resultado.set("")
+        self.label_resultado.configure(text_color=(self.VERDE, "#4ADE80"))
+        self.progresso.set(0)
+        self.percentual.set("0%")
+        self.status.set("Preparando processamento...")
+        threading.Thread(
+            target=self.processar_guias,
+            args=(pasta_pdfs, caminho_excel),
+            daemon=True,
+        ).start()
+
+    def atualizar_progresso(self, atual: int, total: int, nome_arquivo: str) -> None:
+        percentual = int((atual / total) * 100) if total else 0
+        self.progresso.set(atual / total if total else 0)
+        self.percentual.set(f"{percentual}%")
+        self.status.set(f"Processando {atual} de {total}: {nome_arquivo}")
+
+    def processar_guias(self, pasta_pdfs: Path, caminho_excel: Path) -> None:
+        try:
+            def callback(atual: int, total: int, nome: str) -> None:
+                self.raiz.after(
+                    0,
+                    lambda: self.atualizar_progresso(atual, total, nome),
+                )
+
+            self.raiz.after(0, lambda: self.status.set("Lendo PDFs e planilha..."))
+            caminho_saida, total = executar_com_progresso(
+                pasta_pdfs,
+                caminho_excel,
+                callback,
+            )
+            self.arquivo_saida = caminho_saida
+            self.raiz.after(0, lambda: self.finalizar_sucesso(total))
+        except Exception as erro:
+            self.raiz.after(0, lambda: self.finalizar_erro(str(erro)))
+
+    def finalizar_sucesso(self, total: int) -> None:
+        self.progresso.set(1)
+        self.percentual.set("100%")
+        self.status.set("Processamento concluído.")
+        self.resultado.set(
+            f"Concluído: {total} arquivo(s) processado(s).\n"
+            f"Planilha criada: {self.arquivo_saida}"
+        )
+
+        for botao in [
+            self.botao_processar,
+            self.botao_selecionar_pdfs,
+            self.botao_selecionar_excel,
+        ]:
+            botao.configure(state="normal")
+        self.botao_abrir.configure(state="normal")
+
+        messagebox.showinfo(
+            "Processamento concluído",
+            f"{total} arquivo(s) processado(s).\n\n"
+            f"Planilha criada com sucesso em:\n{self.arquivo_saida}",
+        )
+
+    def finalizar_erro(self, mensagem: str) -> None:
+        self.status.set("Processamento não concluído.")
+        self.resultado.set(f"Erro: {mensagem}")
+        self.label_resultado.configure(text_color=(self.VERMELHO, "#F87171"))
+
+        for botao in [
+            self.botao_processar,
+            self.botao_selecionar_pdfs,
+            self.botao_selecionar_excel,
+        ]:
+            botao.configure(state="normal")
+        self.botao_abrir.configure(state="disabled")
+        messagebox.showerror("Erro no processamento", mensagem)
+
+    def abrir_planilha(self) -> None:
+        if self.arquivo_saida and self.arquivo_saida.exists():
+            if sys.platform == "win32":
+                os.startfile(self.arquivo_saida)
+            elif sys.platform == "darwin":
+                os.system(f'open "{self.arquivo_saida}"')
+            else:
+                os.system(f'xdg-open "{self.arquivo_saida}"')
+        else:
+            messagebox.showwarning(
+                "Planilha não encontrada",
+                "A planilha de resultado não está disponível.",
+            )
+
+
+def main() -> None:
+    if sys.platform == "win32":
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "br.com.icona.conferencia.guias.pis.cofins"
+        )
+
+    ctk.set_appearance_mode("Dark")
+    ctk.set_default_color_theme("blue")
+    raiz = ctk.CTk()
+    ConferenciaApp(raiz)
+    raiz.mainloop()
+
+
+if __name__ == "__main__":
+    main()
