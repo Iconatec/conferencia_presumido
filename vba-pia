@@ -1,0 +1,91 @@
+Sub gerar_planilha()
+
+Dim ws As Worksheet
+Dim ws2 As Worksheet
+Dim i As Long
+Dim ultimaLinha As Long
+
+Set ws = ActiveWorkbook.Sheets("Presumido - Apuração")
+periodo = InputBox("Informar no formato: Mês/Ano" & vbCrLf & "Exemplo: Janeiro/2026", "Qual o período de apuração?")
+
+If periodo = "" Then
+MsgBox "Processso cancelado"
+Exit Sub
+End If
+
+
+Application.ScreenUpdating = False
+'criar ou limpar aba Base Guias
+On Error Resume Next
+Set ws2 = Worksheets("Base Guias")
+On Error GoTo 0
+
+If ws2 Is Nothing Then
+    Set ws2 = Worksheets.Add
+    ws2.Name = "Base Guias"
+Else
+    ws2.Cells.Clear
+End If
+
+ws2.Range("A1:H1").Value = Array("Obra", "Razão Social", "CNPJ", "Período", "Base", "Valor Guia", "Código", "Nome Arquivo")
+ultimaLinha = ws.Cells(ws.Rows.Count, "B").End(xlUp).Row
+linhaBase = 2
+
+For i = 26 To ultimaLinha
+'PIS
+If ws.Cells(i, "D").Value > 0 And ws.Cells(i, "B").Value <> "" Then
+    ws2.Cells(linhaBase, "A").Value = ws.Cells(i, "B").Value
+    ws2.Cells(linhaBase, "B").Value = ws.Cells(2, "B").Value
+    ws2.Cells(linhaBase, "C").Value = ws.Cells(3, "B").Value
+    ws2.Cells(linhaBase, "D").Value = periodo
+    ws2.Cells(linhaBase, "E").Value = ws.Cells(i, "C").Value
+    ws2.Cells(linhaBase, "F").Value = ws.Cells(i, "D").Value
+    ws2.Cells(linhaBase, "G").Value = "8109"
+    ws2.Cells(linhaBase, "H").Value = "PIS - " & ws.Cells(i, "F").Value
+    linhaBase = linhaBase + 1
+End If
+
+'COFINS
+If ws.Cells(i, "E").Value > 0 And ws.Cells(i, "B").Value <> "" Then
+    ws2.Cells(linhaBase, "A").Value = ws.Cells(i, "B").Value
+    ws2.Cells(linhaBase, "B").Value = ws.Cells(2, "B").Value
+    ws2.Cells(linhaBase, "C").Value = ws.Cells(3, "B").Value
+    ws2.Cells(linhaBase, "D").Value = periodo
+    ws2.Cells(linhaBase, "E").Value = ws.Cells(i, "C").Value
+    ws2.Cells(linhaBase, "F").Value = ws.Cells(i, "E").Value
+    ws2.Cells(linhaBase, "G").Value = "2172"
+    ws2.Cells(linhaBase, "H").Value = "COFINS - " & ws.Cells(i, "F").Value
+    linhaBase = linhaBase + 1
+End If
+Next i
+
+
+'Formatação da base guias
+ws2.Range("E:F").NumberFormat = "#,##0.00"
+ws2.Columns("A:H").AutoFit
+ws2.Activate
+ws2.Rows("2:2").Select
+ActiveWindow.FreezePanes = True
+ws2.Range("A1:H1").Font.Bold = True
+
+'Criar novo arquivo somente com a Base Guias
+Dim wbNovo As Workbook
+Dim caminhoArquivo As String
+
+ws2.Copy
+Set wbNovo = ActiveWorkbook
+
+caminhoArquivo = ThisWorkbook.Path & Application.PathSeparator & "Apuração-pis-cofins.xlsx"
+
+Application.DisplayAlerts = False
+wbNovo.SaveAs Filename:=caminhoArquivo, FileFormat:=xlOpenXMLWorkbook
+Application.DisplayAlerts = True
+
+wbNovo.Close SaveChanges:=False
+
+Application.ScreenUpdating = True
+MsgBox "Processo finalizado" & vbCrLf & "Arquivo salvo em: " & caminhoArquivo
+End Sub
+
+
+
