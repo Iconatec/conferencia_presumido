@@ -1,0 +1,91 @@
+Sub gerar_plan_presumido()
+
+Dim ws9 As Worksheet
+Dim ws10 As Worksheet
+
+Dim i As Long
+Dim ultimaLinha As Long
+
+Set ws9 = ActiveWorkbook.Sheets("Resumo Apuração RET-PIS-COFINS")
+periodo = InputBox("Informar no formato: Mês/Ano" & vbCrLf & "Exemplo: Janeiro/2026", "Qual o período de apuração?")
+
+If periodo = "" Then
+MsgBox "Processso cancelado"
+Exit Sub
+End If
+
+Application.ScreenUpdating = False
+
+'criar ou limpar aba Base Guias RET
+On Error Resume Next
+Set ws10 = Worksheets("Base Guias")
+On Error GoTo 0
+
+If ws10 Is Nothing Then
+    Set ws10 = Worksheets.Add
+    ws10.Name = "Base Guias"
+Else
+    ws10.Cells.Clear
+End If
+
+ws10.Range("A1:H1").Value = Array("Obra", "Razão Social", "CNPJ", "Período", "Base", "Valor Guia", "Código", "Nome Arquivo")
+ultimaLinha = ws9.Cells(ws9.Rows.Count, "B").End(xlUp).Row - 1
+linhaBase = 2
+
+
+For i = 2 To ultimaLinha
+'PIS
+If IsNumeric(ws9.Cells(i, "G").Value) And ws9.Cells(i, "G").Value > 0 Then
+    ws10.Cells(linhaBase, "A").Value = ws9.Cells(i, "B").Value
+    ws10.Cells(linhaBase, "B").Value = ws9.Cells(i, "B").Value
+    ws10.Cells(linhaBase, "C").Value = ws9.Cells(i, "L").Value
+    ws10.Cells(linhaBase, "D").Value = periodo
+    ws10.Cells(linhaBase, "E").Value = ws9.Cells(i, "E").Value
+    ws10.Cells(linhaBase, "F").Value = Round(ws9.Cells(i, "G").Value, 2)
+    ws10.Cells(linhaBase, "G").Value = "8109"
+    ws10.Cells(linhaBase, "H").Value = "PIS - " & ws9.Cells(i, "B").Value
+    linhaBase = linhaBase + 1
+End If
+
+'COFINS
+If IsNumeric(ws9.Cells(i, "H").Value) And ws9.Cells(i, "H").Value > 0 Then
+    ws10.Cells(linhaBase, "A").Value = ws9.Cells(i, "B").Value
+    ws10.Cells(linhaBase, "B").Value = ws9.Cells(i, "B").Value
+    ws10.Cells(linhaBase, "C").Value = ws9.Cells(i, "L").Value
+    ws10.Cells(linhaBase, "D").Value = periodo
+    ws10.Cells(linhaBase, "E").Value = ws9.Cells(i, "E").Value
+    ws10.Cells(linhaBase, "F").Value = Round(ws9.Cells(i, "H").Value, 2)
+    ws10.Cells(linhaBase, "G").Value = "2172"
+    ws10.Cells(linhaBase, "H").Value = "COFINS - " & ws9.Cells(i, "B").Value
+    linhaBase = linhaBase + 1
+End If
+Next i
+
+'Formatação
+ws10.Range("E:F").NumberFormat = "#,##0.00"
+ws10.Columns("C").NumberFormat = "00\.000\.000\/0000\-00"
+ws10.Columns("A:H").AutoFit
+ws10.Range("A1:H1").Font.Bold = True
+ws10.Activate
+ws10.Rows("2:2").Select
+ActiveWindow.FreezePanes = True
+
+'Criar novo arquivo somente com a Base Guias
+Dim wbNovo As Workbook
+Dim caminhoArquivo As String
+
+ws10.Copy
+Set wbNovo = ActiveWorkbook
+
+caminhoArquivo = ThisWorkbook.Path & Application.PathSeparator & "Apuração-pis-cofins.xlsx"
+
+Application.DisplayAlerts = False
+wbNovo.SaveAs Filename:=caminhoArquivo, FileFormat:=xlOpenXMLWorkbook
+Application.DisplayAlerts = True
+
+wbNovo.Close SaveChanges:=False
+
+Application.ScreenUpdating = True
+MsgBox "Processo finalizado" & vbCrLf & "Arquivo salvo em: " & caminhoArquivo
+
+End Sub
